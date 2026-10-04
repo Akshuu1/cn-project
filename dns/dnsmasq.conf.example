@@ -1,0 +1,15 @@
+# ---- Team X private DNS (Mac 1) ----
+# don't read /etc/resolv.conf; forward other names to the router
+no-resolv
+server=10.7.16.163
+# listen on loopback + LAN IP
+listen-address=127.0.0.1,10.7.22.129
+bind-interfaces
+# our zone is local only - never forwarded to the internet
+local=/teamX.test/
+# records -> Mac 2 (edge)
+host-record=app.teamX.test,10.7.9.158
+host-record=api.teamX.test,10.7.9.158
+# log every query (great for demo + debugging)
+log-queries
+log-facility=/tmp/dnsmasq.log
