@@ -3,7 +3,7 @@
 no-resolv
 server=10.7.16.163
 # listen on loopback + LAN IP
-listen-address=127.0.0.1,10.7.22.129
+listen-address=127.0.0.1,10.7.2.57
 bind-interfaces
 # our zone is local only - never forwarded to the internet
 local=/teamX.test/
