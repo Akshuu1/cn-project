@@ -9,7 +9,7 @@ Domain: `app.teamX.test`, `api.teamX.test` (`.test`, not `.local`).
 
 | Mac | Role | IP | Service |
 |-----|------|----|---------|
-| 1 | Private DNS + test client | 10.7.22.129 | dnsmasq :53 |
+| 1 | Private DNS + test client | 10.7.2.57 | dnsmasq :53 |
 | 2 | Edge / reverse proxy / LB | 10.7.9.158 | nginx :80 → :443 (TLS, HTTP/2) |
 | 3 | Backend A | 10.7.16.163 | `backend/server.js` :3001 |
 | 4 | Backend B + test client | 10.7.17.238 | `backend/server.js` :3002 |
@@ -38,7 +38,7 @@ BACKEND_ID=B PORT=3002 node backend/server.js   # Mac 4
 ```
 Endpoints: `/`, `/api/status` (JSON, `no-store`), `/api/cached` (`max-age=60` + ETag, 304 on `If-None-Match`). Every response has `X-Backend: A|B`.
 
-**DNS** (Mac 1): copy `dns/dnsmasq.conf.example` to `/opt/homebrew/etc/dnsmasq.conf`, replace `teamX` with real team name, `sudo brew services start dnsmasq`. Point Mac 2/3/4 DNS at 10.7.22.129.
+**DNS** (Mac 1): copy `dns/dnsmasq.conf.example` to `/opt/homebrew/etc/dnsmasq.conf`, replace `teamX` with real team name, `sudo brew services start dnsmasq`. Point Mac 2/3/4 DNS at 10.7.2.57.
 
 **Edge** (Mac 2): put `ngnix/teamX-phase1.conf` in nginx `servers/` dir, `sudo nginx -t && sudo nginx -s reload`. Needs cert + key at `/opt/homebrew/etc/nginx/certs/app.teamX.test.{crt,key}`.
 
