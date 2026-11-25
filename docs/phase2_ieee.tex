@@ -1,0 +1,281 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage[T1]{fontenc}
+\usepackage{cite}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+\lstset{basicstyle=\ttfamily\footnotesize,columns=fullflexible,frame=single,
+  framerule=0.3pt,rulecolor=\color{gray!60},backgroundcolor=\color{gray!6},
+  breaklines=true,xleftmargin=2pt,xrightmargin=2pt,aboveskip=4pt,belowskip=4pt}
+\newcommand{\ip}[1]{\texttt{#1}}
+\newcommand{\ok}{$\checkmark$}
+\renewcommand{\arraystretch}{1.15}
+
+\begin{document}
+
+\title{Hardening a Private Network Service Platform: Backup DNS, Service Isolation, Failover and DNS-Based Edge Migration on a Local LAN\\[4pt]
+\large Computer Networks Course Project --- Phase 2 Final Report}
+
+\author{\IEEEauthorblockN{[Name 1], [Name 2], [Name 3], [Name 4]}
+\IEEEauthorblockA{Team X, Computer Networks Course Project\\
+Newton School of Technology, Rishihood University, Sonipat, India}}
+
+\maketitle
+
+\begin{abstract}
+Phase~1 of this project built a private service on four laptops: a client resolves \texttt{app.teamX.test} through the team's own DNS server, connects over HTTPS to an nginx edge, and is load-balanced across two REST backends. This report describes Phase~2, which kept the same network and made it resilient, isolated and diagnosable. We added a backup DNS resolver, lowered the DNS TTL to 30~s to demonstrate caching during a controlled record change, restricted backend ports to the edge with packet-filter rules, enabled passive health-check failover in nginx, and moved traffic to a standby edge through a DNS cutover. The primary DNS machine became a Windows laptop running CoreDNS, with dnsmasq on macOS as the backup. All tests passed. We also report five real faults met during the build, each found with a layer-by-layer method (DNS, TCP, TLS, HTTP, host). The remaining single point of failure is the edge proxy.
+\end{abstract}
+
+\begin{IEEEkeywords}
+DNS, TTL, CoreDNS, dnsmasq, nginx, load balancing, high availability, failover, packet filter, TLS, troubleshooting
+\end{IEEEkeywords}
+
+% =====================================================
+\section{Introduction}
+A request to a web service depends on several layers working in sequence. Name resolution comes first~\cite{rfc1034,rfc1035}, then a TCP connection, a TLS handshake~\cite{rfc8446} and finally the HTTP exchange~\cite{rfc9110}. In Phase~1 we built each of these layers on a private Wi-Fi network and captured them with Wireshark. Phase~2 asks a different question: \emph{what happens when parts of this chain fail, and how do we keep the service available and find the fault?}
+
+Phase~2 made the following changes and tests:
+\begin{itemize}
+\item a backup DNS resolver with identical records, tested by stopping the primary (Ext.~A);
+\item a 30-second TTL used to show client-side caching during a record change (Ext.~B);
+\item backend isolation, so that only the edge can reach backend ports (Ext.~C);
+\item health-check failover between backends in nginx (Ext.~D);
+\item a standby edge and a DNS-based cutover to it (Ext.~E);
+\item a layer-by-layer diagnosis method (Ext.~F), applied to five real faults we met during the build.
+\end{itemize}
+
+The report is organised around the four items required for the Phase~2 report. Section~II describes \emph{what changed from Phase~1}. Sections~III and~IV give the \emph{resilience tests and results}. Section~V presents the \emph{troubleshooting findings}. Section~VI gives the \emph{learning summary}, one paragraph per extension. Section~VII concludes.
+
+% =====================================================
+\section{What Changed from Phase 1}
+
+\subsection{Platform change}
+The DNS machine of Phase~1 (``Mac~1'') was replaced by a Windows laptop. dnsmasq~\cite{dnsmasq} does not run on Windows, so the primary DNS server became CoreDNS~\cite{coredns}. CoreDNS is configured with a \texttt{Corefile}, using the \texttt{hosts} plugin for the private zone and the \texttt{forward} plugin for all other names. dnsmasq on macOS is used as the backup. Because DNS is a standard protocol, macOS and Windows clients behave the same way with either server.
+
+\subsection{Summary of changes}
+Table~\ref{tab:changes} lists every change from Phase~1. Fig.~\ref{fig:topology} shows the Phase~2 topology, and Table~\ref{tab:devices} lists each device's role.
+
+\begin{table}[!t]
+\caption{Changes from Phase 1 to Phase 2}
+\label{tab:changes}
+\centering\footnotesize
+\begin{tabularx}{\columnwidth}{@{}>{\raggedright}p{1.6cm}>{\raggedright}p{2.0cm}>{\raggedright\arraybackslash}X@{}}
+\toprule
+\textbf{Area} & \textbf{Phase 1} & \textbf{Phase 2} \\
+\midrule
+Primary DNS & Mac 1, dnsmasq & Windows PC, CoreDNS \\
+Backup DNS & none & dnsmasq on Mac 3, same records (Ext.~A) \\
+Client DNS list & one server & two servers: primary, backup \\
+DNS TTL & 60 s & 30 s (Ext.~B) \\
+Backend ports & open to whole LAN & edge \ip{10.7.8.211} only, via pf (Ext.~C) \\
+nginx upstream & round-robin & + \texttt{max\_fails}, \texttt{fail\_timeout}, \texttt{proxy\_next\_upstream} (Ext.~D) \\
+Edge & Mac 2 only & + standby nginx on Mac 3; \texttt{X-Edge} header (Ext.~E) \\
+Backup config & --- & \texttt{no-hosts} added after a stale hosts-file entry (Sec.~V) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.80\textwidth]{topology-phase2.png}
+\caption{Phase 2 network topology. Items marked with a star were added in Phase 2. Dashed lines show the shared DNS records (primary and backup) and the copied edge configuration (standby).}
+\label{fig:topology}
+\end{figure*}
+
+\begin{table}[!t]
+\caption{Devices, Roles and Services}
+\label{tab:devices}
+\centering\footnotesize
+\begin{tabularx}{\columnwidth}{@{}>{\raggedright}p{1.25cm}>{\raggedright}p{1.65cm}>{\raggedright}X>{\raggedright\arraybackslash}p{1.45cm}@{}}
+\toprule
+\textbf{Device} & \textbf{IP} & \textbf{Role / ports} & \textbf{Cloud equiv.} \\
+\midrule
+Windows PC & \ip{<WINDOWS\_IP>} & Primary DNS (CoreDNS, 53), client & Route 53 \\
+Mac 2 & \ip{10.7.8.211} & nginx edge, TLS, LB (80, 443) & AWS ALB \\
+Mac 3 & \ip{10.7.9.158} & Backend A (3001), backup DNS (53), standby edge (443) & App instance, secondary DNS \\
+Mac 4 & \ip{<MAC4\_IP>} & Backend B (3002), client, captures & App instance \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Request flow}
+Fig.~\ref{fig:flow} shows one HTTPS request, layer by layer, including the two Phase~2 fallback paths. If the primary DNS server does not answer, the client retries the backup. If Backend~A refuses a connection, nginx retries the request on Backend~B. TLS is terminated at the edge, and the edge talks to the backends in plain HTTP over the LAN.
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.78\textwidth]{request-flow-phase2.png}
+\caption{Phase 2 request flow. Solid arrows: normal path. Dashed arrows: fallback when the primary DNS server (Ext.~A) or Backend~A (Ext.~D) fails.}
+\label{fig:flow}
+\end{figure*}
+
+% =====================================================
+\section{Phase 2 Extensions: Design and Test Method}
+
+\begin{table*}[!t]
+\caption{Resilience Test Results}
+\label{tab:results}
+\centering\scriptsize
+\begin{tabularx}{\textwidth}{@{}l>{\raggedright}p{3.2cm}>{\raggedright}p{3.4cm}>{\raggedright}X>{\raggedright}p{3.6cm}c@{}}
+\toprule
+\textbf{\#} & \textbf{Test} & \textbf{Expected} & \textbf{Observed} & \textbf{Evidence} & \textbf{Result} \\
+\midrule
+A1 & Clients list both DNS servers & primary and backup listed & \ip{<WINDOWS\_IP>}, \ip{10.7.9.158} & \texttt{A1-dns-servers.png} & \ok \\
+A2 & Primary DNS stopped & clients resolve via backup & \texttt{SERVER: 10.7.9.158\#53}, answer \ip{10.7.8.211}; site works & \texttt{A2-backup-answer.png} & \ok \\
+B1 & Record changed, TTL 30 s & cached old IP; server already new & cache $\rightarrow$ \ip{10.7.8.211}; server $\rightarrow$ \ip{10.7.9.158} & \texttt{B1-cached-vs-new.png} & \ok \\
+B2 & TTL expiry / manual flush & new IP & new IP after 30 s; immediately after flush & \texttt{B2-after-flush.png} & \ok \\
+C1 & Client $\rightarrow$ backend :3001 & blocked & connection timed out & \texttt{C1-client-blocked.png} & \ok \\
+C2 & Edge $\rightarrow$ backend :3001 & allowed & HTTP 200 & \texttt{C2-edge-allowed.png} & \ok \\
+D1 & Backend A stopped & all traffic to B, no errors & every response 200, \texttt{X-Backend: B} & \texttt{D1-only-B.png} & \ok \\
+D2 & Backend A restarted & round-robin resumes & A/B alternate within about 10 s & \texttt{D2-roundrobin-resumed.png} & \ok \\
+E1 & DNS cutover to standby edge & \texttt{X-Edge} switches after TTL & \texttt{mac2-primary} $\rightarrow$ \texttt{mac3-standby} & \texttt{E1-edge-switch.png} & \ok \\
+\bottomrule
+\end{tabularx}
+\end{table*}
+
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=0.72\textwidth]{resilience-tests.png}
+\caption{Phase 2 resilience tests: what was broken in each extension and what kept working.}
+\label{fig:res}
+\end{figure*}
+
+\subsection{Ext. A --- Backup DNS Resolver}
+dnsmasq on Mac~3 serves exactly the same records as CoreDNS on the Windows PC (\texttt{app}/\texttt{api.teamX.test} $\rightarrow$ \ip{10.7.8.211}) and listens on \ip{10.7.9.158:53}. Each client lists both servers, primary first:
+\begin{lstlisting}
+# macOS
+sudo networksetup -setdnsservers Wi-Fi <WINDOWS_IP> 10.7.9.158
+# Windows
+Set-DnsClientServerAddress -InterfaceAlias "Wi-Fi" -ServerAddresses ("127.0.0.1","10.7.9.158")
+\end{lstlisting}
+\textit{Test:} we queried both servers directly and checked that they gave the same answer. We then stopped CoreDNS, flushed the client cache, resolved the name again, and fetched \texttt{/api/status} over HTTPS.
+
+\subsection{Ext. B --- TTL and Controlled Record Change}
+The TTL was set to 30~s on both servers (\texttt{ttl 30} in the Corefile, \texttt{local-ttl=30} in dnsmasq). DNS answers may be cached for at most their TTL~\cite{rfc1035}. Windows lists its cache with a live countdown, so we used it as the test client.
+
+\textit{Test:} we cached the answer and changed the record on both servers to \ip{10.7.9.158}. Within 30~s we compared \texttt{Resolve-DnsName} (which uses the cache) with \texttt{Resolve-DnsName -Server 127.0.0.1 -DnsOnly} (which asks the server directly). We repeated the lookup after the TTL expired and again after \texttt{Clear-DnsClientCache}.
+
+\subsection{Ext. C --- Service Isolation}
+Packet-filter rules~\cite{pf} on Mac~3 and Mac~4 were loaded into a separate anchor (\texttt{com.apple/team}), so \texttt{/etc/pf.conf} was never modified:
+\begin{lstlisting}
+pass in quick on lo0 all
+pass in quick proto tcp from 10.7.8.211 to any port { 3001 3002 }
+block drop in quick proto tcp from any to any port { 3001 3002 }
+\end{lstlisting}
+\textit{Test:} we connected to port 3001 from a client and from the edge, and loaded the service through the edge. A rollback copy of the rules was kept, and the rules were removed after the demonstration.
+
+\subsection{Ext. D --- High-Availability Failover}
+Open-source nginx supports passive health checks~\cite{nginxup}. With \texttt{max\_fails=2 fail\_timeout=10s}, nginx skips an upstream for 10~s after two failed attempts. \texttt{proxy\_next\_upstream error timeout http\_502 http\_503} retries a failed request on the other backend, and \texttt{proxy\_connect\_timeout 2s} keeps the delay short.
+
+\textit{Test:} a continuous request loop printed the status code and the \texttt{X-Backend} header while we stopped Backend~A and later restarted it.
+
+\subsection{Ext. E --- DNS-Based Edge Migration}
+A standby nginx on Mac~3 runs the same configuration and certificate as Mac~2. Only its \texttt{X-Edge} header is different (\texttt{mac3-standby}). We checked the standby with \texttt{curl --resolve} before switching.
+
+\textit{Test:} with the TTL at 30~s, we changed \texttt{app.teamX.test} to \ip{10.7.9.158} on both DNS servers while a loop printed \texttt{X-Edge}, then restored the record.
+
+\subsection{Ext. F --- Troubleshooting Method}
+For a fault injected by the faculty, we check one layer at a time and stop at the first layer that fails (Table~\ref{tab:method}).
+
+\begin{table}[!t]
+\caption{Layer-by-Layer Diagnosis Method}
+\label{tab:method}
+\centering\scriptsize
+\begin{tabularx}{\columnwidth}{@{}>{\raggedright}p{0.8cm}>{\raggedright}X>{\raggedright\arraybackslash}p{1.75cm}@{}}
+\toprule
+\textbf{Layer} & \textbf{Check (macOS / Windows)} & \textbf{Healthy result} \\
+\midrule
+DNS & \texttt{dig app.teamX.test} / \texttt{Resolve-DnsName} & answer \ip{10.7.8.211} from our server \\
+TCP & \texttt{nc -vz 10.7.8.211 443} /\newline \texttt{Test-NetConnection\newline -Port 443} & connect succeeds \\
+TLS & \texttt{openssl s\_client\newline -servername app.teamX.test} & verify code 0 \\
+HTTP & \texttt{curl -v https://app.teamX.test\newline /api/status} & 200, \texttt{X-Backend} \\
+Host & \texttt{nginx -t}, error log,\newline \texttt{lsof -iTCP:3001} & services listening \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+% =====================================================
+\section{Resilience Tests and Results}
+Table~\ref{tab:results} summarises the results. Each test was run on the live system, and the evidence file named in the table is stored in \texttt{evidence/phase2/}. Fig.~\ref{fig:res} shows the six tests as diagrams.
+
+
+
+\subsection{Discussion}
+\textit{DNS failure vs.\ application failure (Ext.~A).} When the primary DNS server stopped, the first lookup on each client took a few seconds while the resolver gave up on the primary. After that, the backup answered. This kind of failure is a resolution failure: the name stops resolving even though the servers behind it are healthy. An application failure is different: the name resolves and the TCP and TLS connection to the edge succeeds, but the edge returns an error such as \texttt{502 Bad Gateway}.
+
+\textit{Caching (Ext.~B).} The cached and direct lookups gave different answers at the same moment. This shows that a changed record reaches clients only when their cache expires, which is what is commonly called ``DNS propagation.''
+
+\textit{Remaining single point of failure (Ext.~D/E).} If the nginx edge on Mac~2 stops, DNS still resolves but nothing accepts connections on port 443. Removing this single point needs two active edges sharing a floating virtual IP (VRRP~\cite{rfc5798}), or health-checked DNS failover. Ext.~E is a manual version of the latter, and its switchover time is bounded by the TTL. A standby edge on another host must also be added to the Ext.~C allow rule. On Mac~3 the standby reaches Backend~A over loopback, which the rules already allow.
+
+% =====================================================
+\section{Troubleshooting Findings}
+We hit five real faults while building Phase~2. Each was isolated with the method in Table~\ref{tab:method}.
+
+\textit{Fault 1 --- Backup DNS never started.}
+\textbf{Symptom:} with the primary stopped, nothing resolved, and \texttt{dig @10.7.9.158} returned ``no servers could be reached.''
+\textbf{Layer:} DNS service on Mac~3.
+\textbf{Cause:} \texttt{brew services list} showed dnsmasq with status \texttt{none}. \texttt{dnsmasq --test} failed with ``command not found'' because Homebrew installs it in \texttt{\$(brew --prefix)/sbin}, which is not on the default \texttt{PATH}.
+\textbf{Fix:} we validated the configuration using the full path, then started the service with root privileges, which are needed to bind port~53.
+
+\textit{Fault 2 --- Primary unreachable from peers.}
+\textbf{Symptom:} \texttt{dig @<WINDOWS\_IP>} from Mac~4 timed out.
+\textbf{Cause:} CoreDNS had been left stopped after the failover test. Windows Firewall also needs explicit inbound rules for UDP/TCP~53.
+\textbf{Fix:} we restarted CoreDNS and confirmed the inbound rules.
+
+\textit{Fault 3 --- Primary and backup disagreed.}
+\textbf{Symptom:} the primary returned \ip{10.7.8.211}, but the backup returned \ip{10.7.9.158}.
+\textbf{Cause:} Mac~3's \texttt{dnsmasq.conf} was correct, but \texttt{/etc/hosts} still held a leftover line \texttt{10.7.9.158 app.teamX.test}. dnsmasq also serves \texttt{/etc/hosts}, so it returned \emph{two} A records, one of them wrong. This is why the service broke whenever the backup answered: clients were sent to a host with nothing on port~443.
+\textbf{Fix:} we deleted the line, added \texttt{no-hosts} to the dnsmasq configuration, restarted dnsmasq and flushed the client caches.
+
+\textit{Fault 4 --- Client bypassed both resolvers.}
+\textbf{Symptom:} with CoreDNS stopped, Mac~4 got \texttt{NXDOMAIN} from \texttt{SERVER: 8.8.8.8\#53}.
+\textbf{Cause:} Mac~4's DNS list was not set to our two servers, so it used a public resolver that knows nothing about \texttt{.test}.
+\textbf{Fix:} we set both servers with \texttt{networksetup}. Queries were then answered by \ip{10.7.9.158}.
+
+\textit{Fault 5 --- Platform difference.}
+dnsmasq is not available on Windows. We replaced it with CoreDNS, which provides the same features: a \texttt{hosts} plugin with a configurable TTL, and \texttt{forward} for all other names.
+
+\textit{Lessons.} A backup resolver helps only if every client lists it \emph{and} it serves the same records as the primary. Project names must never be placed in any machine's hosts file, because that bypasses DNS and makes the servers disagree.
+
+% =====================================================
+\section{Learning Summary}
+
+\textit{Extension A --- Backup DNS.} DNS is a dependency of every request, so it needs redundancy just as the application does. A secondary resolver helps only when it holds identical records \emph{and} every client lists it. We saw both conditions fail in practice (Faults 3 and 4). We also learnt to separate DNS failures (the name does not resolve) from application failures (the name resolves but the service returns errors). This is the first question to ask in any outage.
+
+\textit{Extension B --- TTL.} A DNS answer is a cached promise that is valid for its TTL. Changing a record does not change the answers clients already hold. Comparing a cached lookup with a direct query to the server made both answers visible at the same moment. This explains why production migrations lower the TTL well in advance.
+
+\textit{Extension C --- Service isolation.} Routing all traffic through one edge works only if nothing can bypass it. Allowing only the edge's IP on the backend ports is the local equivalent of private subnets and security groups in the cloud. Loading the rules into a separate pf anchor, with a rollback copy, made the change safe to apply and to undo.
+
+\textit{Extension D --- HA failover.} Passive health checks, together with retrying on the next upstream, hid a backend failure completely from users. Making one tier redundant exposes the next single point of failure, which here is the edge itself.
+
+\textit{Extension E --- Edge migration.} DNS can move traffic between entire edges without touching any client. The TTL sets how long the overlap lasts, and an identifying response header made the switchover visible. This is a manual form of DNS failover routing.
+
+\textit{Extension F --- Troubleshooting.} Checking DNS, TCP, TLS, HTTP and then the hosts, in that order, turned vague reports such as ``it stopped working'' into specific causes, for example a stale hosts entry or a client using a public resolver. Every Phase~2 fault was found this way.
+
+% =====================================================
+\section{Conclusion}
+Phase~2 made the platform survive the loss of the primary DNS server, the loss of a backend, and a planned move of the edge. It also restricted backend access to the edge alone. Mixing operating systems (Windows CoreDNS as primary, macOS dnsmasq as backup) caused no protocol issues. The faults we did meet came from configuration drift between machines. The main open issue is the single edge proxy. Future work is an active--active edge pair behind a VRRP virtual IP, plus automated checks that the primary and backup DNS records match.
+
+\section*{Repository}
+Configurations (\texttt{dns/}, \texttt{nginx/}, \texttt{firewall/}), backend source, diagrams and evidence: \texttt{[GitHub repo link]}. Private TLS keys are not committed.
+
+\begin{thebibliography}{9}
+\bibitem{rfc1034} P. Mockapetris, ``Domain names---Concepts and facilities,'' RFC 1034, IETF, Nov. 1987.
+\bibitem{rfc1035} P. Mockapetris, ``Domain names---Implementation and specification,'' RFC 1035, IETF, Nov. 1987.
+\bibitem{rfc8446} E. Rescorla, ``The Transport Layer Security (TLS) Protocol Version 1.3,'' RFC 8446, IETF, Aug. 2018.
+\bibitem{rfc9110} R. Fielding, M. Nottingham, and J. Reschke, ``HTTP Semantics,'' RFC 9110, IETF, Jun. 2022.
+\bibitem{rfc5798} S. Nadas, ``Virtual Router Redundancy Protocol (VRRP) Version 3 for IPv4 and IPv6,'' RFC 5798, IETF, Mar. 2010.
+\bibitem{coredns} CoreDNS Authors, ``CoreDNS: DNS and service discovery---plugins: hosts, forward, log.'' [Online]. Available: \url{https://coredns.io/plugins/}
+\bibitem{dnsmasq} S. Kelley, ``dnsmasq---A lightweight DHCP and caching DNS server,'' manual page. [Online]. Available: \url{https://thekelleys.org.uk/dnsmasq/docs/dnsmasq-man.html}
+\bibitem{nginxup} NGINX, ``Module ngx\_http\_upstream\_module'' and ``ngx\_http\_proxy\_module,'' documentation. [Online]. Available: \url{https://nginx.org/en/docs/}
+\bibitem{pf} Apple Inc., \textit{pfctl(8)} and \textit{pf.conf(5)}, macOS manual pages (derived from OpenBSD PF).
+\end{thebibliography}
+
+\end{document}
